@@ -66,7 +66,7 @@ def _pads():
     return Record([("p", 1), ("n", 1)])
 
 class SerDesTop(LiteXModule):
-    def __init__(self, pll_cls, serdes_cls, refclk_freq, linerate, external_clks=False, **kwargs):
+    def __init__(self, pll_cls, serdes_cls, refclk_freq, linerate, external_clks=False, init_status=False, **kwargs):
         self.cd_sys = ClockDomain()
         self.refclk = refclk = Signal()
         self.pll    = pll    = pll_cls(refclk, refclk_freq, linerate)
@@ -77,6 +77,8 @@ class SerDesTop(LiteXModule):
         serdes.add_stream_endpoints()
         serdes.add_controls()
         serdes.add_clock_cycles()
+        if init_status:
+            serdes.add_init_status()
 
 def _instances(fragment, of):
     return [s for s in fragment.specials if isinstance(s, Instance) and s.of == of]
@@ -202,6 +204,17 @@ class TestSerDesXilinx(unittest.TestCase):
         for name in ["TXRATE", "RXRATE"]:
             self.assertIsInstance(_input(channel, name), Signal)
         self.assertIn("tx_raw_enable", verilog)
+
+    def test_gtp_init_status(self):
+        # TX init debug status: CSRs added and design elaborated, with and without TX buffer.
+        for tx_buffer_enable in [False, True]:
+            with self.subTest(tx_buffer_enable=tx_buffer_enable):
+                top, fragment, csrs, verilog = self.elaborate("gtp", "qpll", 125e6, 2.5e9,
+                    init_status=True, tx_buffer_enable=tx_buffer_enable)
+                for csr in ["tx_init_status", "tx_init_restarts", "tx_init_clear", "tx_gt_status",
+                    "tx_clk_ticks", "rx_clk_ticks"]:
+                    self.assertIn(csr, csrs)
+                self.assertEqual(len(_instances(fragment, "GTPE2_CHANNEL")), 1)
 
     def test_ultrascale_unaligned_tx_clock_rejected(self):
         # UltraScale(+): TX user clock (without TX buffer) must be an integer division of the

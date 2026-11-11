@@ -1198,6 +1198,77 @@ class GTP(LiteXModule):
         self.add_polarity_control()
         self.add_electrical_control()
 
+    def add_init_status(self):
+        """Debug status of the TX initialization and of the TX/RX user clocks.
+
+        - tx_init_status: current TX init FSM state and states visited since the last clear (the
+          FSM watchdog restarts it every 1ms while it does not reach READY).
+        - tx_init_restarts: number of TX init restarts (POWER-DOWN entries) since the last clear.
+        - tx_gt_status: GTP TX status outputs seen by the TX init FSM.
+        - tx_clk_ticks/rx_clk_ticks: incremented every 2^16 TX/RX user clock cycles, also while the
+          tx/rx clock domains are held in reset (a stuck value means the clock does not run).
+        """
+        tx_states = ["POWER-DOWN", "DRP", "WAIT-PLL-RESET", "WAIT-INIT-DELAY", "WAIT-GTP-RESET",
+            "ALIGN", "WAIT-ALIGN", "WAIT-FIRST-ALIGN-DONE", "WAIT-SECOND-ALIGN-DONE", "READY"]
+        states_doc = ", ".join(f"{i}: {s}" for i, s in enumerate(tx_states))
+        self._tx_init_status = CSRStatus(fields=[
+            CSRField("state",   size=4, description=f"Current TX init state ({states_doc})."),
+            CSRField("visited", size=len(tx_states), offset=8,
+                description="TX init states visited since the last clear (bit n: state n)."),
+        ])
+        self._tx_init_restarts = CSRStatus(16, description="TX init restarts since the last clear.")
+        self._tx_init_clear    = CSR() # Write to clear the visited states and restarts.
+        self._tx_gt_status = CSRStatus(fields=[
+            CSRField("plllock",         size=1),
+            CSRField("txresetdone",     size=1),
+            CSRField("txdlysresetdone", size=1),
+            CSRField("txphinitdone",    size=1),
+            CSRField("txphaligndone",   size=1),
+        ])
+        self._tx_clk_ticks = CSRStatus(32, description="Incremented every 2^16 TX user clock cycles.")
+        self._rx_clk_ticks = CSRStatus(32, description="Incremented every 2^16 RX user clock cycles.")
+
+        # # #
+
+        tx_init = self.tx_init
+
+        # TX init state, visited states and restarts.
+        ongoing = Signal(len(tx_states))
+        for i, name in enumerate(tx_states):
+            self.comb += [
+                ongoing[i].eq(tx_init.fsm.ongoing(name)),
+                If(ongoing[i], self._tx_init_status.fields.state.eq(i)),
+            ]
+        power_down_d = Signal()
+        self.sync += [
+            power_down_d.eq(ongoing[0]),
+            If(self._tx_init_clear.re,
+                self._tx_init_status.fields.visited.eq(0),
+                self._tx_init_restarts.status.eq(0),
+            ).Else(
+                self._tx_init_status.fields.visited.eq(self._tx_init_status.fields.visited | ongoing),
+                If(ongoing[0] & ~power_down_d & (self._tx_init_restarts.status != (2**16 - 1)),
+                    self._tx_init_restarts.status.eq(self._tx_init_restarts.status + 1)
+                )
+            )
+        ]
+
+        # GTP TX status outputs.
+        for name in ["plllock", "txresetdone", "txdlysresetdone", "txphinitdone", "txphaligndone"]:
+            self.specials += MultiReg(getattr(tx_init, name), getattr(self._tx_gt_status.fields, name))
+
+        # TX/RX user clock activity (counters not reset with the tx/rx clock domains).
+        for cd, ticks in [("tx", self._tx_clk_ticks), ("rx", self._rx_clk_ticks)]:
+            counter   = Signal(16, reset_less=True)
+            toggle    = Signal()
+            toggle_d  = Signal()
+            getattr(self.sync, cd).__iadd__(counter.eq(counter + 1))
+            self.specials += MultiReg(counter[15], toggle)
+            self.sync += [
+                toggle_d.eq(toggle),
+                If(toggle & ~toggle_d, ticks.status.eq(ticks.status + 1)),
+            ]
+
     def add_clock_cycles(self):
         self.clock_latch    = CSRStorage(description="Write to latch TX/RX clock cycles.")
         self.clock_tx_cycles = CSRStorage(32, description="TX clock cycles.")
