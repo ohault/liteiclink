@@ -166,8 +166,12 @@ class GTP(LiteXModule):
         clock_aligner       = True,
         clock_aligner_comma = 0b0101111100,
         tx_polarity         = 0,
-        rx_polarity         = 0):
+        rx_polarity         = 0,
+        raw_datapath        = False):
         assert data_width in [20, 40]
+        if raw_datapath and clock_aligner:
+            raise ValueError("raw_datapath cannot use the K28.5 clock aligner; set clock_aligner=False")
+        self.raw_datapath = raw_datapath
 
         # TX controls.
         self.tx_enable              = Signal(reset=1)
@@ -196,9 +200,17 @@ class GTP(LiteXModule):
 
         self.nwords = nwords = data_width//10
 
-        self.encoder = ClockDomainsRenamer("tx")(Encoder(nwords, True))
-        self.decoders = [ClockDomainsRenamer("rx")(Decoder(True)) for _ in range(nwords)]
-        self.submodules += self.decoders
+        if raw_datapath:
+            # Raw PMA words, registered in the recovered RX clock domain. The
+            # bit slip input is available only when the RX buffer is bypassed.
+            self.raw_tx_data = Signal(data_width)
+            self.raw_rx_data = Signal(data_width)
+            self.raw_rx_bitslip = Signal()
+            self.raw_rx_bitslip_supported = not rx_buffer_enable
+        else:
+            self.encoder = ClockDomainsRenamer("tx")(Encoder(nwords, True))
+            self.decoders = [ClockDomainsRenamer("rx")(Decoder(True)) for _ in range(nwords)]
+            self.submodules += self.decoders
 
         # Transceiver direct clock outputs (useful to specify clock constraints).
         self.txoutclk = Signal()
@@ -727,9 +739,9 @@ class GTP(LiteXModule):
             o_RXBYTEREALIGN        = Open(),
             o_RXCOMMADET           = Open(),
             i_RXCOMMADETEN         = 1,
-            i_RXMCOMMAALIGNEN      = (~clock_aligner & self.rx_align & (rx_prbs_config == 0b00)) if rx_buffer_enable else 0,
-            i_RXPCOMMAALIGNEN      = (~clock_aligner & self.rx_align & (rx_prbs_config == 0b00)) if rx_buffer_enable else 0,
-            i_RXSLIDE              = 0,
+            i_RXMCOMMAALIGNEN      = (~clock_aligner & ~raw_datapath & self.rx_align & (rx_prbs_config == 0b00)) if rx_buffer_enable else 0,
+            i_RXPCOMMAALIGNEN      = (~clock_aligner & ~raw_datapath & self.rx_align & (rx_prbs_config == 0b00)) if rx_buffer_enable else 0,
+            i_RXSLIDE              = self.raw_rx_bitslip if raw_datapath and not rx_buffer_enable else 0,
 
             # Receive Ports - RX Channel Bonding Ports.
             o_RXCHANBONDSEQ        = Open(),
@@ -1012,8 +1024,9 @@ class GTP(LiteXModule):
         # TX Datapath and PRBS ---------------------------------------------------------------------
         self.tx_prbs = ClockDomainsRenamer("tx")(PRBSTX(data_width, reverse=True))
         self.comb += self.tx_prbs.config.eq(tx_prbs_config)
+        tx_prbs_input = self.raw_tx_data if raw_datapath else Cat(*[self.encoder.output[i] for i in range(nwords)])
         self.comb += [
-            self.tx_prbs.i.eq(Cat(*[self.encoder.output[i] for i in range(nwords)])),
+            self.tx_prbs.i.eq(tx_prbs_input),
             If(tx_produce_square_wave,
                 # square wave @ linerate/data_width for scope observation
                 txdata.eq(Signal(data_width, reset=(1<<(data_width//2))-1))
@@ -1035,8 +1048,11 @@ class GTP(LiteXModule):
         # logic in a single RX clock cycle missed timing at 250MHz).
         rxdata_r = Signal(data_width)
         self.sync.rx += rxdata_r.eq(rxdata)
-        for i in range(nwords):
-            self.comb += self.decoders[i].input.eq(rxdata_r[10*i:10*(i+1)])
+        if raw_datapath:
+            self.comb += self.raw_rx_data.eq(rxdata_r)
+        else:
+            for i in range(nwords):
+                self.comb += self.decoders[i].input.eq(rxdata_r[10*i:10*(i+1)])
         self.sync.rx += self.rx_prbs.i.eq(rxdata)
 
         # Clock Aligner ----------------------------------------------------------------------------
@@ -1053,6 +1069,8 @@ class GTP(LiteXModule):
             ]
 
     def add_stream_endpoints(self):
+        if self.raw_datapath:
+            raise RuntimeError("8b/10b stream endpoints are unavailable in raw_datapath mode")
         self.sink   =   sink = stream.Endpoint([("data", self.nwords*8), ("ctrl", self.nwords)])
         self.source = source = stream.Endpoint([("data", self.nwords*8), ("ctrl", self.nwords)])
 
@@ -1120,6 +1138,30 @@ class GTP(LiteXModule):
             self.rx_enable.eq(self._rx_enable.fields.enable),
             self._rx_ready.fields.ready.eq(self.rx_ready),
         ]
+
+    def add_raw_control(self):
+        """Add CSR controls for the raw datapath."""
+        if not self.raw_datapath:
+            raise RuntimeError("raw datapath controls require raw_datapath=True")
+
+        self._raw_status = CSRStatus(fields=[
+            CSRField("tx_ready", size=1, description="TX transceiver is initialized."),
+            CSRField("rx_ready", size=1, description="RX transceiver is initialized."),
+            CSRField("rx_bitslip_supported", size=1, description="RX bit slip is available."),
+        ])
+        self.comb += [
+            self._raw_status.fields.tx_ready.eq(self.tx_ready),
+            self._raw_status.fields.rx_ready.eq(self.rx_ready),
+            self._raw_status.fields.rx_bitslip_supported.eq(int(self.raw_rx_bitslip_supported)),
+        ]
+
+        if self.raw_rx_bitslip_supported:
+            self._raw_rx_bitslip_request = CSRStorage(1,
+                description="Write 1 to issue one RX bit-slip request.")
+            bitslip = PulseSynchronizer("sys", "rx")
+            self.submodules += bitslip
+            self.comb += bitslip.i.eq(self._raw_rx_bitslip_request.storage[0] & self._raw_rx_bitslip_request.wr_stb)
+            self.gtp_params["i_RXSLIDE"] = self.raw_rx_bitslip | bitslip.o
 
     def add_prbs_control(self, rx_errors_width=32):
         self._tx_prbs_config = CSRStorage(fields=[
